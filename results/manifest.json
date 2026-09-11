@@ -1,0 +1,18 @@
+{
+  "seed_base": 20260910,
+  "files": {
+    "ablation.csv": "b7056649c3c1c146",
+    "average.json": "d0a50eea30c7a1b1",
+    "balanced.json": "493b752a0f247fa9",
+    "bottleneck.json": "4367a918b6b0a78d",
+    "controlled_sweeps.csv": "949736b6f2a0589a",
+    "exact_small_instances.json": "e8e1c359872d3973",
+    "extreme.json": "449f2469cc3e70d2",
+    "function_one.json": "d34279edf0d3cf6b",
+    "high_flexibility.json": "e44ad3b0e66ac27b",
+    "high_variance.json": "d4b23a3297d1154e",
+    "low_flexibility.json": "faeb2bcec2eabd7f",
+    "machine_advantage.json": "b07de14cf78846be",
+    "unbalanced.json": "1fb706d3a7df413f"
+  }
+}

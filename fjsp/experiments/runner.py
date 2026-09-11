@@ -35,11 +35,12 @@ INSTANCE_CLASSES = [
 
 def function_one(jobs: int = 5, machines: int = 3, operations: int = 4,
                  instance_class: str = "average", seed: int = 42,
-                 starts: int = 30, local_search: int = 100) -> dict[str, Any]:
+                 starts: int = 30, local_search: int = 100,
+                 tabu_tenure: int = 7) -> dict[str, Any]:
     """Run the complete first milestone and return submission-ready JSON data."""
     instance = generate_instance(jobs, machines, operations,
                                  instance_class=instance_class, seed=seed)
-    schedule = solve(instance, seed, starts, local_search)
+    schedule = solve(instance, seed, starts, local_search, tabu_tenure)
     validation = validate(instance, schedule)
     if not validation.valid:
         raise RuntimeError("Function 1 produced an invalid schedule")
@@ -49,10 +50,11 @@ def function_one(jobs: int = 5, machines: int = 3, operations: int = 4,
         "validation": validation.to_dict(),
         "metrics": metrics(instance, schedule),
         "algorithm": {
-            "name": "congestion_greedy_critical_path_tabu_multistart",
+            "name": "tabu_search_N1_N2",
             "seed": seed,
             "starts": starts,
             "local_search_iterations": local_search,
+            "tabu_tenure": tabu_tenure,
         },
     }
 
@@ -63,7 +65,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     for offset in range(args.repetitions):
         parameters = named_instance_parameters(args.instance_class)
         parameters.setdefault("flexibility", args.flexibility)
-        parameters.setdefault("processing_time_variance", args.variance)
+        parameters.setdefault("processing_time_noise_scale", args.noise_scale)
         parameters.setdefault("bottleneck_probability", args.bottleneck)
         parameters.setdefault("processing_time_max", args.time_max)
         instance = generate_instance(
@@ -72,7 +74,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
             instance_class=args.instance_class, **parameters,
         )
         started = time.perf_counter()
-        schedule = solve(instance, args.seed + offset, args.iterations, args.local_search)
+        schedule = solve(instance, args.seed + offset, args.iterations, args.local_search, args.tabu_tenure)
         runtimes.append(time.perf_counter() - started)
         result = validate(instance, schedule)
         if not result.valid or result.makespan is None:
@@ -88,10 +90,15 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         })
         records.append(record)
     makespans = [record["makespan"] for record in records]
+    n = len(makespans)
+    ci_half = 1.96 * statistics.stdev(makespans) / (n ** 0.5) if n > 1 else 0.0
     return {
         "repetitions": args.repetitions,
         "instance_class": args.instance_class,
         "average_makespan": statistics.mean(makespans),
+        "makespan_ci_95_half": ci_half,
+        "makespan_mean_lower": statistics.mean(makespans) - ci_half,
+        "makespan_mean_upper": statistics.mean(makespans) + ci_half,
         "best_makespan": min(makespans),
         "worst_makespan": max(makespans),
         "average_runtime_ms": statistics.mean(runtimes) * 1000,
@@ -100,10 +107,11 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "makespans": makespans,
         "records": records,
         "algorithm": {
-            "name": "congestion_greedy_critical_path_tabu_multistart",
+            "name": "tabu_search_N1_N2",
             "seed_base": args.seed,
             "iterations": args.iterations,
             "local_search_iterations": args.local_search,
+            "tabu_tenure": args.tabu_tenure,
             "python_version": sys.version.split()[0],
         },
         "generator": {
@@ -127,13 +135,14 @@ def main() -> None:
     common.add_argument("--flexibility", type=float, default=0.5)
     common.add_argument("--time-min", type=int, default=1)
     common.add_argument("--time-max", type=int, default=20)
-    common.add_argument("--variance", type=float, default=0.0)
+    common.add_argument("--noise-scale", type=float, default=0.0)
     common.add_argument("--bottleneck", type=float, default=0.0)
     common.add_argument("--machine-advantage", type=float, default=0.0)
     common.add_argument("--instance-class", default="average", choices=INSTANCE_CLASSES)
     common.add_argument("--seed", type=int, default=42)
     common.add_argument("--iterations", type=int, default=20)
     common.add_argument("--local-search", type=int, default=100)
+    common.add_argument("--tabu-tenure", type=int, default=7)
 
     generate = sub.add_parser("generate", parents=[common])
     generate.add_argument("--output", default="-")
@@ -142,6 +151,7 @@ def main() -> None:
     solve_parser.add_argument("instance")
     solve_parser.add_argument("--iterations", type=int, default=20)
     solve_parser.add_argument("--local-search", type=int, default=100)
+    solve_parser.add_argument("--tabu-tenure", type=int, default=7)
 
     validate_parser = sub.add_parser("validate", help="independently referee a schedule JSON file")
     validate_parser.add_argument("instance")
@@ -155,6 +165,7 @@ def main() -> None:
     function_parser.add_argument("--seed", type=int, default=42)
     function_parser.add_argument("--starts", type=int, default=30)
     function_parser.add_argument("--local-search", type=int, default=100)
+    function_parser.add_argument("--tabu-tenure", type=int, default=7)
     function_parser.add_argument("--output", default="-")
 
     experiment = sub.add_parser("experiment", parents=[common])
@@ -166,7 +177,7 @@ def main() -> None:
         if args.command == "generate":
             data = json.dumps(instance_to_dict(generate_instance(
                 args.jobs, args.machines, args.operations, args.flexibility,
-                args.time_min, args.time_max, args.variance, args.bottleneck,
+                args.time_min, args.time_max, args.noise_scale, args.bottleneck,
                 machine_advantage=args.machine_advantage,
                 seed=args.seed, instance_class=args.instance_class,
             )), indent=2)
@@ -178,7 +189,7 @@ def main() -> None:
         elif args.command == "solve":
             with open(args.instance, encoding="utf-8-sig") as file:
                 instance = instance_from_dict(json.load(file))
-            schedule = solve(instance, instance.seed, args.iterations, args.local_search)
+            schedule = solve(instance, instance.seed, args.iterations, args.local_search, args.tabu_tenure)
             result = validate(instance, schedule)
             print(json.dumps({"schedule": [asdict(item) for item in schedule],
                               "validation": result.to_dict(),
@@ -196,18 +207,20 @@ def main() -> None:
                 item["job"], item["index"], item["machine"], item["start"], item["end"]
             ) for item in raw_schedule]
             result = validate(instance, schedule)
-            print("VALID" if result.valid else "INVALID")
             if result.valid:
+                print("VALID")
                 print(f"Makespan: {result.makespan}")
             else:
+                print("INVALID")
                 for error in result.errors:
                     print(f"Error: {error}")
+                raise SystemExit(1)
         else:
             if args.command == "function-one":
                 data = json.dumps(function_one(
                     args.jobs, args.machines, args.operations,
                     args.instance_class, args.seed,
-                    args.starts, args.local_search,
+                    args.starts, args.local_search, args.tabu_tenure
                 ), indent=2)
                 if args.output == "-":
                     print(data)

@@ -158,149 +158,6 @@ def _compute_critical_path(
     return critical_ops, longest
 
 
-def _extract_critical_blocks(
-    schedule: list[ScheduledOperation],
-    critical_ops: list[tuple[int, int]],
-) -> list[list[ScheduledOperation]]:
-    """Extract critical blocks — maximal runs of critical operations on the same machine.
-
-    A critical block is a maximal sequence of consecutive operations on the
-    same machine where every operation lies on the critical path.  Only blocks
-    of length >= 2 are useful for swap moves.
-    """
-    sched_map = {(item.job, item.index): item for item in schedule}
-    critical_set = set(critical_ops)
-
-    # Group scheduled operations by machine, in time order
-    by_machine: dict[int, list[ScheduledOperation]] = {}
-    for item in schedule:
-        by_machine.setdefault(item.machine, []).append(item)
-    for items in by_machine.values():
-        items.sort(key=lambda item: (item.start, item.end))
-
-    blocks: list[list[ScheduledOperation]] = []
-    for machine, items in by_machine.items():
-        current_block: list[ScheduledOperation] = []
-        for item in items:
-            key = (item.job, item.index)
-            if key in critical_set:
-                current_block.append(item)
-            else:
-                if len(current_block) >= 2:
-                    blocks.append(current_block)
-                current_block = []
-        if len(current_block) >= 2:
-            blocks.append(current_block)
-
-    return blocks
-
-
-# ---------------------------------------------------------------------------
-# Neighbourhood operators
-# ---------------------------------------------------------------------------
-
-def _adjacent_swap_moves(
-    assignments: dict[tuple[int, int], int],
-    priority: dict[tuple[int, int], int],
-    blocks: list[list[ScheduledOperation]],
-) -> list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]]:
-    """Generate adjacent swap moves on critical blocks (N5 neighbourhood).
-
-    For each critical block, try swapping:
-    - The first two operations (may break the incoming critical edge)
-    - The last two operations (may break the outgoing critical edge)
-
-    Returns a list of (new_assignments, new_priority, move_signature) tuples.
-    """
-    moves: list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]] = []
-    for block in blocks:
-        # Swap pairs: first two and last two
-        swap_pairs = []
-        if len(block) >= 2:
-            swap_pairs.append((block[0], block[1]))
-            if len(block) >= 3:
-                swap_pairs.append((block[-2], block[-1]))
-        for a, b in swap_pairs:
-            key_a = (a.job, a.index)
-            key_b = (b.job, b.index)
-            new_priority = priority.copy()
-            # Swap priorities to reverse order on the machine
-            new_priority[key_a], new_priority[key_b] = (
-                new_priority[key_b], new_priority[key_a]
-            )
-            move_sig = ("swap", key_a, key_b)
-            moves.append((assignments.copy(), new_priority, move_sig))
-    return moves
-
-
-def _insertion_moves(
-    instance: Instance,
-    assignments: dict[tuple[int, int], int],
-    priority: dict[tuple[int, int], int],
-    blocks: list[list[ScheduledOperation]],
-    schedule: list[ScheduledOperation],
-) -> list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]]:
-    """Generate insertion moves for critical operations.
-
-    Try removing a critical operation from its current position on the machine
-    and inserting it at the beginning or end of the machine sequence.
-    """
-    moves: list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]] = []
-    critical_keys: set[tuple[int, int]] = set()
-    for block in blocks:
-        for item in block:
-            critical_keys.add((item.job, item.index))
-
-    min_priority = min(priority.values()) if priority else 0
-    max_priority = max(priority.values()) if priority else 0
-
-    for key in critical_keys:
-        # Try inserting at the front (lowest priority) or back (highest priority)
-        for new_prio_val, label in [
-            (min_priority - 1, "insert_front"),
-            (max_priority + 1, "insert_back"),
-        ]:
-            new_priority = priority.copy()
-            new_priority[key] = new_prio_val
-            move_sig = (label, key)
-            moves.append((assignments.copy(), new_priority, move_sig))
-
-    return moves
-
-
-def _reassignment_moves(
-    instance: Instance,
-    assignments: dict[tuple[int, int], int],
-    priority: dict[tuple[int, int], int],
-    blocks: list[list[ScheduledOperation]],
-    rng: random.Random,
-) -> list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]]:
-    """Generate machine reassignment moves for critical operations."""
-    moves: list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]] = []
-    ops_map = {(op.job, op.index): op for op in instance.operations}
-
-    critical_keys: set[tuple[int, int]] = set()
-    for block in blocks:
-        for item in block:
-            critical_keys.add((item.job, item.index))
-
-    max_prio = max(priority.values()) if priority else 0
-
-    for key in critical_keys:
-        operation = ops_map[key]
-        current_machine = assignments[key]
-        alternatives = [m for m in operation.options if m != current_machine]
-        for alt_machine in alternatives:
-            new_assignments = assignments.copy()
-            new_assignments[key] = alt_machine
-            new_priority = priority.copy()
-            new_priority[key] = max_prio + 1
-            move_sig = ("reassign", key, current_machine, alt_machine)
-            moves.append((new_assignments, new_priority, move_sig))
-
-    return moves
-
-
 # ---------------------------------------------------------------------------
 # Main solver
 # ---------------------------------------------------------------------------
@@ -309,181 +166,202 @@ def solve(
     instance: Instance,
     seed: int | None = None,
     iterations: int = 20,
-    local_search_iterations: int = 100,
-    tabu_tenure: int | None = None,
+    local_search_iterations: int = 200,
+    tabu_tenure: int = 7,
 ) -> list[ScheduledOperation]:
-    """Congestion-aware randomized greedy multi-start with critical-path tabu search.
+    """
+    Phase 1: Congestion-aware randomized greedy multi-start construction.
+    Phase 2: Tabu search with machine-reassignment and operation-resequencing moves.
 
-    Parameters
-    ----------
-    instance : Instance
-        The FJSP instance to solve.
-    seed : int | None
-        Random seed for reproducibility.
-    iterations : int
-        Number of independent construction starts (>= 1).
-    local_search_iterations : int
-        Maximum improvement iterations per start (>= 0).
-    tabu_tenure : int | None
-        Number of iterations a move stays tabu.  Defaults to
-        ``ceil(sqrt(num_operations))``.
+    Neighbourhood N1: reassign operation O(j,k) to an alternative eligible machine.
+    Neighbourhood N2: swap the sequence of two adjacent operations on the same machine.
 
-    Returns
-    -------
-    list[ScheduledOperation]
-        The best valid schedule found, sorted by (start, machine, job, index).
+    Tabu list: stores (op_key, from_machine, to_machine) for N1 moves and
+               (op_key_a, op_key_b, machine) for N2 moves, with tenure.
+    Aspiration: accept a tabu move if it beats the global best makespan.
     """
     if iterations < 1:
         raise ValueError("iterations must be positive")
     if local_search_iterations < 0:
         raise ValueError("local_search_iterations must be non-negative")
+
     rng = random.Random(seed)
     operations_by_job = instance.operations_by_job
-    num_ops = len(instance.operations)
-    if tabu_tenure is None:
-        tabu_tenure = max(5, math.ceil(math.sqrt(num_ops)))
 
+    # ── Phase 1: Multi-start greedy construction ──────────────────────────
     best: list[ScheduledOperation] | None = None
     best_makespan = float("inf")
 
-    # ---- Phase 1: Multi-start greedy construction ----
     for _ in range(iterations):
-        ready = {job: 0 for job in range(instance.jobs)}
-        machine_end = {machine: 0 for machine in range(instance.machines)}
-        machine_load = {machine: 0 for machine in range(instance.machines)}
-        next_index = {job: 0 for job in range(instance.jobs)}
+        ready   = {job: 0 for job in range(instance.jobs)}
+        mach_end = {m: 0 for m in range(instance.machines)}
+        mach_load = {m: 0 for m in range(instance.machines)}
+        next_idx = {job: 0 for job in range(instance.jobs)}
         current: list[ScheduledOperation] = []
-        remaining = sum(len(operations) for operations in operations_by_job.values())
+        remaining = sum(len(ops) for ops in operations_by_job.values())
+
         while remaining:
             candidates = []
-            for job, index in next_index.items():
-                operations = operations_by_job[job]
-                if index >= len(operations):
+            for job, idx in next_idx.items():
+                ops = operations_by_job[job]
+                if idx >= len(ops):
                     continue
-                operation = operations[index]
-                for machine, duration in operation.options.items():
-                    start = max(ready[job], machine_end[machine])
+                op = ops[idx]
+                for machine, duration in op.options.items():
+                    start  = max(ready[job], mach_end[machine])
                     finish = start + duration
-                    congestion = machine_load[machine] / max(1, sum(machine_load.values()))
-                    score = (finish + congestion * duration, rng.random())
-                    candidates.append((score, operation, machine, start, finish))
-            _, operation, machine, start, finish = min(candidates, key=lambda item: item[0])
-            current.append(ScheduledOperation(operation.job, operation.index, machine, start, finish))
-            ready[operation.job] = finish
-            next_index[operation.job] += 1
-            machine_end[machine] = finish
-            machine_load[machine] += finish - start
+                    total  = max(1, sum(mach_load.values()))
+                    cong   = mach_load[machine] / total
+                    score  = (finish + cong * duration, rng.random())
+                    candidates.append((score, op, machine, start, finish))
+
+            _, op, machine, start, finish = min(candidates, key=lambda x: x[0])
+            current.append(ScheduledOperation(op.job, op.index, machine, start, finish))
+            ready[op.job]     = finish
+            next_idx[op.job] += 1
+            mach_end[machine]  = finish
+            mach_load[machine] += finish - start
             remaining -= 1
-        result = validate(instance, current)
-        if result.valid and result.makespan is not None and result.makespan < best_makespan:
-            best, best_makespan = current, result.makespan
+
+        vr = validate(instance, current)
+        if vr.valid and vr.makespan is not None and vr.makespan < best_makespan:
+            best, best_makespan = current, vr.makespan
 
     if best is None:
         raise RuntimeError("solver failed to produce a valid schedule")
 
-    # ---- Phase 2: Critical-path tabu search ----
-    if local_search_iterations and num_ops > 1:
-        assignments = {(item.job, item.index): item.machine for item in best}
-        ordered = sorted(best, key=lambda item: (item.start, item.machine, item.job, item.index))
-        priority = {(item.job, item.index): rank for rank, item in enumerate(ordered)}
+    if not local_search_iterations:
+        return sorted(best, key=lambda x: (x.start, x.machine, x.job, x.index))
 
-        search_budget = min(local_search_iterations, max(10, 20000 // num_ops))
-        tabu_list: deque[tuple[Any, ...]] = deque(maxlen=tabu_tenure)
+    # ── Phase 2: Tabu Search ──────────────────────────────────────────────
 
-        no_improve_count = 0
-        max_no_improve = max(10, search_budget // 3)
+    # O(1) op lookup — build once
+    op_lookup = {(o.job, o.index): o for o in instance.operations}
 
-        for iteration in range(search_budget):
-            # Compute the true critical path
-            critical_ops, longest = _compute_critical_path(instance, best)
-            blocks = _extract_critical_blocks(best, critical_ops)
+    assignments = {(item.job, item.index): item.machine for item in best}
+    ordered     = sorted(best, key=lambda x: (x.start, x.machine, x.job, x.index))
+    priority    = {(item.job, item.index): rank for rank, item in enumerate(ordered)}
 
-            if not blocks:
-                # Fall back to random reassignment if no critical blocks
-                key = rng.choice(list(assignments))
-                operation = next(op for op in instance.operations if (op.job, op.index) == key)
-                alternatives = [m for m in operation.options if m != assignments[key]]
-                if not alternatives:
+    global_best       = best
+    global_best_span  = best_makespan
+    current_schedule  = best
+    current_span      = best_makespan
+
+    # O(1) tabu lookup via dict instead of linear deque scan
+    tabu: dict[tuple, int] = {}  # sig -> expiry_iteration
+
+    def is_tabu(sig: tuple, iteration: int) -> bool:
+        return tabu.get(sig, 0) > iteration
+
+    def add_tabu(sig: tuple, iteration: int) -> None:
+        tabu[sig] = iteration + tabu_tenure
+
+    def fast_makespan(sched: list[ScheduledOperation]) -> int:
+        return max(s.end for s in sched) if sched else 0
+
+    budget = min(local_search_iterations, max(20, 30000 // max(1, len(instance.operations))))
+    stagnation = 0
+    max_stagnation = 15
+
+    for iteration in range(budget):
+        best_move_delta = float("inf")
+        best_move       = None
+        best_move_sig   = None
+        best_move_type  = None
+
+        # ── Neighbourhood N1: machine reassignment ────────────────────────
+        crit_ops, _ = _compute_critical_path(instance, current_schedule)
+        crit_keys = set(crit_ops)
+        all_keys  = list(assignments.keys())
+        # Prioritise critical ops but evaluate all within a sample budget
+        candidate_keys = list(crit_keys) + [k for k in all_keys if k not in crit_keys]
+        sample_size    = min(len(candidate_keys), max(10, len(candidate_keys) // 3))
+        sampled_keys   = candidate_keys[:sample_size]
+
+        for key in sampled_keys:
+            op = op_lookup[key]                    # O(1) instead of O(O)
+            current_machine = assignments[key]
+            for alt_machine in op.options:
+                if alt_machine == current_machine:
                     continue
-                trial_assignments = assignments.copy()
-                trial_assignments[key] = rng.choice(alternatives)
-                trial_priority = priority.copy()
-                trial_priority[key] = max(trial_priority.values()) + 1
+                sig     = ("N1", key, current_machine, alt_machine)
+                rev_sig = ("N1", key, alt_machine, current_machine)
+
+                trial_assign = assignments.copy()
+                trial_assign[key] = alt_machine
                 try:
-                    trial = _rebuild(instance, trial_assignments, trial_priority)
+                    trial_sched = _rebuild(instance, trial_assign, priority)
                 except (KeyError, ValueError):
                     continue
-                trial_result = validate(instance, trial)
-                if trial_result.valid and trial_result.makespan is not None and trial_result.makespan < best_makespan:
-                    best, best_makespan = trial, trial_result.makespan
-                    assignments, priority = trial_assignments, trial_priority
-                    no_improve_count = 0
-                continue
 
-            # Generate all candidate moves
-            candidate_moves: list[tuple[dict[tuple[int, int], int], dict[tuple[int, int], int], tuple[Any, ...]]] = []
-            candidate_moves.extend(_adjacent_swap_moves(assignments, priority, blocks))
-            candidate_moves.extend(_insertion_moves(instance, assignments, priority, blocks, best))
-            candidate_moves.extend(_reassignment_moves(instance, assignments, priority, blocks, rng))
+                span = fast_makespan(trial_sched)  # O(O) instead of full validate
+                delta = span - current_span
+                tabu_blocked = is_tabu(sig, iteration) or is_tabu(rev_sig, iteration)
+                aspirated    = span < global_best_span
 
-            if not candidate_moves:
-                continue
+                if (not tabu_blocked or aspirated) and delta < best_move_delta:
+                    best_move_delta = delta
+                    best_move       = (trial_assign, trial_sched, span)
+                    best_move_sig   = sig
+                    best_move_type  = "N1"
 
-            # Evaluate all candidates, pick the best non-tabu (or aspiration)
-            best_candidate = None
-            best_candidate_makespan = float("inf")
-            best_candidate_move_sig: tuple[Any, ...] | None = None
+        # ── Neighbourhood N2: swap two adjacent ops on same machine ───────
+        by_machine_now: dict[int, list[ScheduledOperation]] = {}
+        for item in current_schedule:
+            by_machine_now.setdefault(item.machine, []).append(item)
 
-            # Shuffle to break ties randomly
-            rng.shuffle(candidate_moves)
+        for machine_items in by_machine_now.values():
+            machine_items.sort(key=lambda x: x.start)
+            for left, right in zip(machine_items, machine_items[1:]):
+                lk = (left.job,  left.index)
+                rk = (right.job, right.index)
+                sig     = ("N2", lk, rk, left.machine)
+                rev_sig = ("N2", rk, lk, left.machine)
 
-            for trial_assignments, trial_priority, move_sig in candidate_moves:
-                is_tabu = move_sig in tabu_list
-
+                # Try swapping their priority ranks
+                trial_prio = priority.copy()
+                trial_prio[lk], trial_prio[rk] = trial_prio[rk], trial_prio[lk]
                 try:
-                    trial = _rebuild(instance, trial_assignments, trial_priority)
+                    trial_sched = _rebuild(instance, assignments, trial_prio)
                 except (KeyError, ValueError):
                     continue
-                trial_result = validate(instance, trial)
-                if not trial_result.valid or trial_result.makespan is None:
-                    continue
 
-                # Accept if: (not tabu AND improves over current best candidate)
-                #          OR (aspiration: beats global best)
-                if trial_result.makespan < best_candidate_makespan:
-                    if not is_tabu or trial_result.makespan < best_makespan:
-                        best_candidate = trial
-                        best_candidate_makespan = trial_result.makespan
-                        best_candidate_move_sig = move_sig
-                        # If this is already better than global best,
-                        # we can skip evaluating more moves for speed
-                        if trial_result.makespan < best_makespan:
-                            break
+                span = fast_makespan(trial_sched)  # O(O) instead of full validate
+                delta = span - current_span
+                tabu_blocked = is_tabu(sig, iteration) or is_tabu(rev_sig, iteration)
+                aspirated    = span < global_best_span
 
-            if best_candidate is not None and best_candidate_move_sig is not None:
-                # Apply the move
-                if best_candidate_makespan < best_makespan:
-                    best = best_candidate
-                    best_makespan = best_candidate_makespan
-                    no_improve_count = 0
-                else:
-                    no_improve_count += 1
+                if (not tabu_blocked or aspirated) and delta < best_move_delta:
+                    best_move_delta = delta
+                    best_move       = (assignments, trial_sched, span)
+                    best_move_sig   = sig
+                    best_move_type  = "N2"
 
-                # Update assignments and priority from the accepted schedule
-                assignments = {(item.job, item.index): item.machine for item in best_candidate}
-                priority = {
-                    (item.job, item.index): rank
-                    for rank, item in enumerate(
-                        sorted(best_candidate, key=lambda item: (item.start, item.machine, item.job, item.index))
-                    )
-                }
+        if best_move is None:
+            # No improving or non-tabu move found; continue to next iteration
+            continue
 
-                # Add reverse move to tabu list
-                tabu_list.append(best_candidate_move_sig)
-            else:
-                no_improve_count += 1
+        new_assign, new_sched, new_span = best_move
+        add_tabu(best_move_sig, iteration)
 
-            if no_improve_count >= max_no_improve:
+        # Update current solution (accept any best non-tabu move, even if worse)
+        if best_move_type == "N1":
+            assignments = new_assign
+        else:
+            # N2: update priority from the new schedule's order
+            reordered = sorted(new_sched, key=lambda x: (x.start, x.machine, x.job, x.index))
+            priority  = {(item.job, item.index): rank for rank, item in enumerate(reordered)}
+
+        current_schedule = new_sched
+        current_span     = new_span
+
+        if new_span < global_best_span:
+            global_best      = new_sched
+            global_best_span = new_span
+            stagnation = 0
+        else:
+            stagnation += 1
+            if stagnation >= max_stagnation:
                 break
 
-    return sorted(best, key=lambda item: (item.start, item.machine, item.job, item.index))
+    return sorted(global_best, key=lambda x: (x.start, x.machine, x.job, x.index))

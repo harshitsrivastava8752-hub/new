@@ -47,29 +47,28 @@ For valid schedules, `metrics` reconstructs job completion times, machine
 utilization, the actual schedule critical path (including job and machine
 sequence edges), a safe lower bound, and the lower-bound gap.
 
-## 4. Algorithm
+## 4. Algorithm — Tabu Search
 
-The solver is a randomized greedy multi-start dispatching heuristic followed by
-a bounded critical-machine neighborhood search. At each construction step it
-considers every currently ready operation and eligible machine. The primary
-score is earliest resulting finish time plus a congestion penalty based on
-accumulated machine load; a random tie-breaker creates independent starts. The
-improvement phase prioritizes adjacent operations on currently used machines,
-tries alternative eligible machines, rebuilds the schedule, and accepts only
-validated makespan improvements. The best validated schedule across starts is
-returned. The `function-one` command exposes the complete first milestone as a
-single JSON artifact containing instance, schedule, validation, metrics, and
-algorithm configuration.
+**Phase 1 (Construction):** `iterations` independent congestion-aware
+randomized greedy starts. At each step, every ready operation × eligible
+machine is scored by `finish_time + congestion_ratio × duration`. A random
+tie-breaker creates diverse starts. The best validated schedule is kept.
 
-The representation is a list of `(job, operation, machine, start, end)`.
-The search space consists of machine assignments and the induced order of
-ready operations. The objective is makespan. With `I` starts, `O` operations,
-and `M` machines, construction is approximately `O(I * O^2 * M)` in this
-straightforward implementation; memory is `O(O + M)`.
-
-This approach intentionally prioritizes explainability and valid schedules over
-claiming optimality. `results/ablation.csv` measures the benefit of the local
-search against the multi-start constructor alone.
+**Phase 2 (Tabu Search):**
+- **Representation:** machine assignment dict + priority order of operations.
+- **Neighbourhood N1:** reassign operation O(j,k) to an alternative eligible
+  machine. |N1| ≤ O × (M−1).
+- **Neighbourhood N2:** swap the priority ranks of two adjacent operations on
+  the same machine, inducing a resequencing. |N2| ≤ total adjacent pairs.
+- **Tabu list:** deque of (move_signature, expiry_iteration) with tenure T=7.
+  Reverse moves are also stored as tabu to prevent immediate cycling.
+- **Aspiration criterion:** a tabu move is accepted if it beats the global
+  best makespan.
+- **Acceptance:** best non-tabu (or aspirated) move is accepted each
+  iteration, even if it worsens the current makespan (allows escaping
+  local optima).
+- **Budget:** min(local_search_iterations, 30000 / |operations|).
+- **Complexity:** O(budget × (O×M + adjacent_pairs)) per call.
 
 ## 5. Experiments and failure analysis
 

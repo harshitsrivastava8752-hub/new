@@ -9,8 +9,10 @@
     "flexibility": 0.5,
     "processing_time_min": 1,
     "processing_time_max": 10000,
-    "processing_time_variance": 0.0,
+    "processing_time_noise_scale": 0.0,
     "bottleneck_probability": 0.0,
+    "bottleneck_machine": 0,
+    "specialist_machine": 1,
     "machine_advantage": 0.0,
     "instance_class": "average"
   },
@@ -19,32 +21,32 @@
       "job": 0,
       "index": 0,
       "options": {
-        "0": 5994,
-        "1": 5648
+        "0": 9290,
+        "1": 4165
       }
     },
     {
       "job": 0,
       "index": 1,
       "options": {
-        "0": 3069,
-        "1": 2118
+        "0": 2118,
+        "1": 6522
       }
     },
     {
       "job": 1,
       "index": 0,
       "options": {
-        "0": 7980,
-        "1": 4128
+        "0": 2316,
+        "1": 4508
       }
     },
     {
       "job": 1,
       "index": 1,
       "options": {
-        "0": 5767,
-        "1": 7162
+        "0": 3478,
+        "1": 8073
       }
     }
   ]
